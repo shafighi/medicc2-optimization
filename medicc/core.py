@@ -1,7 +1,6 @@
 import copy
 import logging
 import os
-from functools import lru_cache
 from itertools import combinations
 
 import Bio
@@ -312,11 +311,23 @@ def shorten_cn_strings(string_1, string_2):
             string_2_short = "123d"
     '''
     assert len(string_1) == len(string_2)
-    keep_indices = [i for i in range(len(string_1)) if
-                    i == 0 or (string_1[i] != string_1[i - 1]) or (string_2[i] != string_2[i - 1])]
-    string_1_short = ''.join(string_1[i] for i in keep_indices)
-    string_2_short = ''.join(string_2[i] for i in keep_indices)
-    return string_1_short, string_2_short
+    if len(string_1) == 0:
+        return '', ''
+
+    string_1_short = [string_1[0]]
+    string_2_short = [string_2[0]]
+    prev_1 = string_1[0]
+    prev_2 = string_2[0]
+    for idx in range(1, len(string_1)):
+        char_1 = string_1[idx]
+        char_2 = string_2[idx]
+        if char_1 != prev_1 or char_2 != prev_2:
+            string_1_short.append(char_1)
+            string_2_short.append(char_2)
+        prev_1 = char_1
+        prev_2 = char_2
+
+    return ''.join(string_1_short), ''.join(string_2_short)
 
 
 def parallelization_calc_pairwise_distance(sample_labels, asymm_fst, CN_str_dict, n_cores):
@@ -338,7 +349,6 @@ def parallelization_calc_pairwise_distance(sample_labels, asymm_fst, CN_str_dict
     return pdm
 
 
-@lru_cache(maxsize=None)
 def calc_MED_distance(model_fst, profile_1, profile_2):
     '''
     Calculate the MED distance between two profiles represented as strings.
@@ -359,19 +369,24 @@ def calc_MED_distance(model_fst, profile_1, profile_2):
 
 def calc_pairwise_distance_matrix(model_fst, cn_str_dict, parallel_run=True):
     samples = list(cn_str_dict.keys())
-    pdm = pd.DataFrame(0, index=samples, columns=samples, dtype=float)
-    combs = list(combinations(samples, 2))
-    ncombs = len(combs)
+    pdm = np.zeros((len(samples), len(samples)), dtype=float)
+    ncombs = len(samples) * (len(samples) - 1) // 2
+    next_log_percentage = 10
 
-    for i, (sample_a, sample_b) in enumerate(combs):
+    for i, (sample_a_idx, sample_b_idx) in enumerate(combinations(range(len(samples)), 2), start=1):
+        sample_a = samples[sample_a_idx]
+        sample_b = samples[sample_b_idx]
         cur_dist = calc_MED_distance(model_fst, cn_str_dict[sample_a], cn_str_dict[sample_b])
-        pdm.loc[sample_a, sample_b] = cur_dist
-        pdm.loc[sample_b, sample_a] = cur_dist
+        pdm[sample_a_idx, sample_b_idx] = cur_dist
+        pdm[sample_b_idx, sample_a_idx] = cur_dist
 
-        if not parallel_run and (100 * (i + 1) / ncombs) % 10 == 0:  # log every 10%
-            logger.info(f'{(i + 1) / ncombs * 100:.2f}')
+        if not parallel_run and ncombs > 0:
+            percentage_done = 100 * i / ncombs
+            if percentage_done >= next_log_percentage:
+                logger.info(f'{percentage_done:.2f}')
+                next_log_percentage += 10
 
-    return pdm
+    return pd.DataFrame(pdm, index=samples, columns=samples)
 
 
 def infer_tree_topology(pairwise_distances, labels, normal_name):

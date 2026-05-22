@@ -2,6 +2,7 @@ import os
 import pathlib
 import subprocess
 import time
+from itertools import combinations
 
 import numpy as np
 import pandas as pd
@@ -9,6 +10,26 @@ import pytest
 
 import fstlib
 import medicc
+
+
+def _reference_shorten_cn_strings(string_1, string_2):
+    keep_indices = [i for i in range(len(string_1)) if
+                    i == 0 or (string_1[i] != string_1[i - 1]) or (string_2[i] != string_2[i - 1])]
+    string_1_short = ''.join(string_1[i] for i in keep_indices)
+    string_2_short = ''.join(string_2[i] for i in keep_indices)
+    return string_1_short, string_2_short
+
+
+def _reference_pairwise_distance_matrix(model_fst, cn_str_dict):
+    samples = list(cn_str_dict.keys())
+    pdm = pd.DataFrame(0, index=samples, columns=samples, dtype=float)
+
+    for sample_a, sample_b in combinations(samples, 2):
+        cur_dist = medicc.calc_MED_distance(model_fst, cn_str_dict[sample_a], cn_str_dict[sample_b])
+        pdm.loc[sample_a, sample_b] = cur_dist
+        pdm.loc[sample_b, sample_a] = cur_dist
+
+    return pdm
 
 
 def test_medicc_help_box():
@@ -22,6 +43,38 @@ def test_medicc_help_box():
         time.sleep(0.5)
 
     assert process.returncode == 0
+
+
+def test_shorten_cn_strings_matches_previous_reference_simulation():
+    rng = np.random.default_rng(2026)
+    alphabet = np.array(list('012345678X'))
+
+    for length in rng.integers(1, 2000, size=100):
+        profile_1 = ''.join(rng.choice(alphabet, size=length))
+        profile_2 = ''.join(rng.choice(alphabet, size=length))
+        assert medicc.shorten_cn_strings(profile_1, profile_2) == _reference_shorten_cn_strings(
+            profile_1, profile_2)
+
+
+def test_calc_MED_distance_is_not_unbounded_lru_cache():
+    assert not hasattr(medicc.calc_MED_distance, 'cache_info')
+
+
+def test_pairwise_distance_matrix_matches_previous_reference_simulation():
+    rng = np.random.default_rng(2026)
+    medicc_fst = medicc.io.read_fst()
+    simulated_profiles = {}
+
+    for sample_idx in range(14):
+        chromosomes = []
+        for _ in range(6):
+            copy_numbers = rng.integers(0, 6, size=18)
+            chromosomes.append(''.join(copy_numbers.astype(str)))
+        simulated_profiles[f'cell_{sample_idx}'] = 'X'.join(chromosomes)
+
+    expected = _reference_pairwise_distance_matrix(medicc_fst, simulated_profiles)
+    observed = medicc.calc_pairwise_distance_matrix(medicc_fst, simulated_profiles, parallel_run=False)
+    pd.testing.assert_frame_equal(observed, expected)
 
 
 def test_medicc_distance_speed_up():
