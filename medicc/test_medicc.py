@@ -49,6 +49,10 @@ def test_shorten_cn_strings_matches_previous_reference_simulation():
     rng = np.random.default_rng(2026)
     alphabet = np.array(list('012345678X'))
 
+    assert medicc.shorten_cn_strings('', '') == _reference_shorten_cn_strings('', '')
+    assert medicc.shorten_cn_strings('111XX222', '111XX333') == _reference_shorten_cn_strings(
+        '111XX222', '111XX333')
+
     for length in rng.integers(1, 2000, size=100):
         profile_1 = ''.join(rng.choice(alphabet, size=length))
         profile_2 = ''.join(rng.choice(alphabet, size=length))
@@ -75,6 +79,15 @@ def test_pairwise_distance_matrix_matches_previous_reference_simulation():
     expected = _reference_pairwise_distance_matrix(medicc_fst, simulated_profiles)
     observed = medicc.calc_pairwise_distance_matrix(medicc_fst, simulated_profiles, parallel_run=False)
     pd.testing.assert_frame_equal(observed, expected)
+
+
+def test_pairwise_distance_matrix_matches_previous_reference_edge_cases():
+    medicc_fst = medicc.io.read_fst()
+
+    for simulated_profiles in ({}, {'cell_0': '111X222'}):
+        expected = _reference_pairwise_distance_matrix(medicc_fst, simulated_profiles)
+        observed = medicc.calc_pairwise_distance_matrix(medicc_fst, simulated_profiles, parallel_run=False)
+        pd.testing.assert_frame_equal(observed, expected)
 
 
 def test_medicc_distance_speed_up():
