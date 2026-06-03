@@ -1,5 +1,6 @@
 import copy
 import logging
+import multiprocessing as mp
 import os
 from itertools import combinations
 
@@ -14,6 +15,21 @@ from medicc import io, nj, tools, event_reconstruction
 
 # prepare logger 
 logger = logging.getLogger(__name__)
+
+_PAIRWISE_WORKER_MODEL_FST = None
+_PAIRWISE_WORKER_CN_STR_DICT = None
+
+
+def _env_int(name, default):
+    value = os.environ.get(name)
+    if value is None or value == "":
+        return default
+    try:
+        parsed = int(value)
+    except ValueError:
+        logger.warning("%s=%r is not an integer; using %s", name, value, default)
+        return default
+    return parsed
 
 
 def main(input_df,
@@ -331,22 +347,14 @@ def shorten_cn_strings(string_1, string_2):
 
 
 def parallelization_calc_pairwise_distance(sample_labels, asymm_fst, CN_str_dict, n_cores):
-    try:
-        from joblib import Parallel, delayed
-    except ImportError:
-        raise ImportError("joblib must be installed for parallelization")
-
-    parallelization_groups = medicc.tools.create_parallelization_groups(len(sample_labels))
-    parallelization_groups = [sample_labels[group] for group in parallelization_groups]
-    logger.info("Running {} parallel runs on {} cores".format(len(parallelization_groups), n_cores))
-
-    parallel_pairwise_distances = Parallel(n_jobs=n_cores)(delayed(calc_pairwise_distance_matrix)(
-        asymm_fst, {key: val for key, val in CN_str_dict.items() if key in cur_group}, True)
-            for cur_group in parallelization_groups)
-
-    pdm = medicc.tools.total_pdm_from_parallel_pdms(sample_labels, parallel_pairwise_distances)
-
-    return pdm
+    workers_default = max(1, min(int(n_cores), 2)) if n_cores is not None else 1
+    os.environ.setdefault("MEDICC2_PAIRWISE_WORKERS", str(workers_default))
+    logger.info("Using memory-bounded pairwise MEDICC implementation; "
+                "set MEDICC2_PAIRWISE_WORKERS and MEDICC2_PAIRWISE_BATCH_SIZE to tune.")
+    return calc_pairwise_distance_matrix(
+        asymm_fst,
+        {key: CN_str_dict[key] for key in sample_labels},
+        parallel_run=False)
 
 
 def calc_MED_distance(model_fst, profile_1, profile_2):
@@ -367,21 +375,82 @@ def calc_MED_distance(model_fst, profile_1, profile_2):
     return distance
 
 
+def _pairwise_worker_init(model_fst, cn_str_dict):
+    global _PAIRWISE_WORKER_MODEL_FST
+    global _PAIRWISE_WORKER_CN_STR_DICT
+    _PAIRWISE_WORKER_MODEL_FST = model_fst
+    _PAIRWISE_WORKER_CN_STR_DICT = cn_str_dict
+
+
+def _pairwise_chunk_worker(chunk):
+    results = []
+    for sample_a_idx, sample_b_idx, sample_a, sample_b in chunk:
+        cur_dist = calc_MED_distance(
+            _PAIRWISE_WORKER_MODEL_FST,
+            _PAIRWISE_WORKER_CN_STR_DICT[sample_a],
+            _PAIRWISE_WORKER_CN_STR_DICT[sample_b])
+        results.append((sample_a_idx, sample_b_idx, cur_dist))
+    return results
+
+
+def _pairwise_chunks(samples, batch_size):
+    chunk = []
+    for sample_a_idx, sample_b_idx in combinations(range(len(samples)), 2):
+        chunk.append((sample_a_idx, sample_b_idx,
+                      samples[sample_a_idx], samples[sample_b_idx]))
+        if len(chunk) >= batch_size:
+            yield chunk
+            chunk = []
+    if chunk:
+        yield chunk
+
+
+def _fill_pairwise_distances(pdm, chunk_results):
+    for sample_a_idx, sample_b_idx, cur_dist in chunk_results:
+        pdm[sample_a_idx, sample_b_idx] = cur_dist
+        pdm[sample_b_idx, sample_a_idx] = cur_dist
+
+
 def calc_pairwise_distance_matrix(model_fst, cn_str_dict, parallel_run=True):
     samples = list(cn_str_dict.keys())
     pdm = np.zeros((len(samples), len(samples)), dtype=float)
     ncombs = len(samples) * (len(samples) - 1) // 2
     next_log_percentage = 10
+    batch_size = max(1, _env_int("MEDICC2_PAIRWISE_BATCH_SIZE", 64))
+    workers = max(1, _env_int("MEDICC2_PAIRWISE_WORKERS", 1))
+    mode = os.environ.get("MEDICC2_PAIRWISE_MODE", "forked").strip().lower()
 
-    for i, (sample_a_idx, sample_b_idx) in enumerate(combinations(range(len(samples)), 2), start=1):
-        sample_a = samples[sample_a_idx]
-        sample_b = samples[sample_b_idx]
-        cur_dist = calc_MED_distance(model_fst, cn_str_dict[sample_a], cn_str_dict[sample_b])
-        pdm[sample_a_idx, sample_b_idx] = cur_dist
-        pdm[sample_b_idx, sample_a_idx] = cur_dist
+    if mode == "forked" and ncombs > batch_size and "fork" in mp.get_all_start_methods():
+        logger.info("Calculating pairwise MEDICC distances in forked batches "
+                    "(pairs=%d, batch_size=%d, workers=%d).",
+                    ncombs, batch_size, workers)
+        completed = 0
+        ctx = mp.get_context("fork")
+        chunks = list(_pairwise_chunks(samples, batch_size))
+        with ctx.Pool(processes=workers,
+                      initializer=_pairwise_worker_init,
+                      initargs=(model_fst, cn_str_dict),
+                      maxtasksperchild=1) as pool:
+            for chunk_results in pool.imap_unordered(_pairwise_chunk_worker, chunks):
+                _fill_pairwise_distances(pdm, chunk_results)
+                completed += len(chunk_results)
+                if ncombs > 0:
+                    percentage_done = 100 * completed / ncombs
+                    if percentage_done >= next_log_percentage:
+                        logger.info(f'{percentage_done:.2f}')
+                        next_log_percentage += 10
+        return pd.DataFrame(pdm, index=samples, columns=samples)
 
-        if not parallel_run and ncombs > 0:
-            percentage_done = 100 * i / ncombs
+    logger.info("Calculating pairwise MEDICC distances in-process "
+                "(pairs=%d, mode=%s).", ncombs, mode)
+    for i, chunk in enumerate(_pairwise_chunks(samples, batch_size), start=1):
+        _pairwise_worker_init(model_fst, cn_str_dict)
+        chunk_results = _pairwise_chunk_worker(chunk)
+        _fill_pairwise_distances(pdm, chunk_results)
+
+        completed = min(i * batch_size, ncombs)
+        if ncombs > 0:
+            percentage_done = 100 * completed / ncombs
             if percentage_done >= next_log_percentage:
                 logger.info(f'{percentage_done:.2f}')
                 next_log_percentage += 10

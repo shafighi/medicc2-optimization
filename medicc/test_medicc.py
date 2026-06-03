@@ -81,6 +81,26 @@ def test_pairwise_distance_matrix_matches_previous_reference_simulation():
     pd.testing.assert_frame_equal(observed, expected)
 
 
+def test_pairwise_distance_matrix_forked_batches_match_previous_reference(monkeypatch):
+    rng = np.random.default_rng(2027)
+    medicc_fst = medicc.io.read_fst()
+    simulated_profiles = {}
+
+    for sample_idx in range(8):
+        chromosomes = []
+        for _ in range(4):
+            copy_numbers = rng.integers(0, 5, size=12)
+            chromosomes.append(''.join(copy_numbers.astype(str)))
+        simulated_profiles[f'cell_{sample_idx}'] = 'X'.join(chromosomes)
+
+    expected = _reference_pairwise_distance_matrix(medicc_fst, simulated_profiles)
+    monkeypatch.setenv("MEDICC2_PAIRWISE_MODE", "forked")
+    monkeypatch.setenv("MEDICC2_PAIRWISE_BATCH_SIZE", "3")
+    monkeypatch.setenv("MEDICC2_PAIRWISE_WORKERS", "1")
+    observed = medicc.calc_pairwise_distance_matrix(medicc_fst, simulated_profiles, parallel_run=False)
+    pd.testing.assert_frame_equal(observed, expected)
+
+
 def test_pairwise_distance_matrix_matches_previous_reference_edge_cases():
     medicc_fst = medicc.io.read_fst()
 
