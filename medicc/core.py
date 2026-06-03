@@ -411,6 +411,32 @@ def _fill_pairwise_distances(pdm, chunk_results):
         pdm[sample_b_idx, sample_a_idx] = cur_dist
 
 
+def _pairwise_child_worker(connection, model_fst, cn_str_dict, chunk):
+    try:
+        _pairwise_worker_init(model_fst, cn_str_dict)
+        connection.send((True, _pairwise_chunk_worker(chunk)))
+    except Exception as exc:
+        connection.send((False, repr(exc)))
+    finally:
+        connection.close()
+
+
+def _run_pairwise_chunk_in_forked_child(ctx, model_fst, cn_str_dict, chunk):
+    parent_conn, child_conn = ctx.Pipe(duplex=False)
+    process = ctx.Process(target=_pairwise_child_worker,
+                          args=(child_conn, model_fst, cn_str_dict, chunk))
+    process.start()
+    child_conn.close()
+    ok, payload = parent_conn.recv()
+    process.join()
+    parent_conn.close()
+    if not ok:
+        raise RuntimeError(payload)
+    if process.exitcode != 0:
+        raise RuntimeError(f"Pairwise worker exited with status {process.exitcode}")
+    return payload
+
+
 def calc_pairwise_distance_matrix(model_fst, cn_str_dict, parallel_run=True):
     samples = list(cn_str_dict.keys())
     pdm = np.zeros((len(samples), len(samples)), dtype=float)
@@ -426,19 +452,19 @@ def calc_pairwise_distance_matrix(model_fst, cn_str_dict, parallel_run=True):
                     ncombs, batch_size, workers)
         completed = 0
         ctx = mp.get_context("fork")
-        chunks = list(_pairwise_chunks(samples, batch_size))
-        with ctx.Pool(processes=workers,
-                      initializer=_pairwise_worker_init,
-                      initargs=(model_fst, cn_str_dict),
-                      maxtasksperchild=1) as pool:
-            for chunk_results in pool.imap_unordered(_pairwise_chunk_worker, chunks):
-                _fill_pairwise_distances(pdm, chunk_results)
-                completed += len(chunk_results)
-                if ncombs > 0:
-                    percentage_done = 100 * completed / ncombs
-                    if percentage_done >= next_log_percentage:
-                        logger.info(f'{percentage_done:.2f}')
-                        next_log_percentage += 10
+        if workers != 1:
+            logger.warning("MEDICC2_PAIRWISE_WORKERS=%d requested, but forked mode "
+                           "currently runs one batch process at a time.", workers)
+        for chunk in _pairwise_chunks(samples, batch_size):
+            chunk_results = _run_pairwise_chunk_in_forked_child(
+                ctx, model_fst, cn_str_dict, chunk)
+            _fill_pairwise_distances(pdm, chunk_results)
+            completed += len(chunk_results)
+            if ncombs > 0:
+                percentage_done = 100 * completed / ncombs
+                if percentage_done >= next_log_percentage:
+                    logger.info(f'{percentage_done:.2f}')
+                    next_log_percentage += 10
         return pd.DataFrame(pdm, index=samples, columns=samples)
 
     logger.info("Calculating pairwise MEDICC distances in-process "
