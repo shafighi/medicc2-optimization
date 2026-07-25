@@ -1,7 +1,14 @@
 import copy
+import hashlib
 import logging
 import multiprocessing as mp
 import os
+import pickle
+import subprocess
+import sys
+import tempfile
+import threading
+from concurrent.futures import ThreadPoolExecutor
 from itertools import combinations
 
 import Bio
@@ -18,6 +25,9 @@ logger = logging.getLogger(__name__)
 
 _PAIRWISE_WORKER_MODEL_FST = None
 _PAIRWISE_WORKER_CN_STR_DICT = None
+_PAIRWISE_THREAD_LOCAL = threading.local()
+_PAIRWISE_THREAD_MODEL_STATE = None
+_PAIRWISE_THREAD_CN_STR_DICT = None
 
 
 def _env_int(name, default):
@@ -53,9 +63,10 @@ def main(input_df,
     logger.info("Validating input.")
     io.validate_input(input_df, symbol_table, normal_name=normal_name)
 
-    ## Compile input data into FSAs stored in dictionaries
-    logger.info("Compiling input sequences into FSAs.")
-    FSA_dict, CN_str_dict = create_standard_fsa_dict_from_data(input_df, symbol_table, chr_separator)
+    ## Compile compact strings for pairwise distance calculation. Full FSAs are
+    ## constructed only if ancestral reconstruction needs them.
+    logger.info("Compiling input copy-number strings.")
+    CN_str_dict = create_cn_string_dict_from_data(input_df, chr_separator)
     sample_labels = input_df.index.get_level_values('sample_id').unique()
 
     ## Reconstruct a tree
@@ -81,7 +92,8 @@ def main(input_df,
     else:
         logger.info("Tree provided, using it. No pairwise distance matrix is calculated!")
 
-        pairwise_distances = pd.DataFrame(0, columns=FSA_dict.keys(), index=FSA_dict.keys())
+        pairwise_distances = pd.DataFrame(
+            0, columns=CN_str_dict.keys(), index=CN_str_dict.keys())
 
         assert len([x for x in list(input_tree.find_clades()) if x.name is not None and 'internal' not in x.name]) == \
             len(np.unique(input_df.index.get_level_values('sample_id'))), \
@@ -102,6 +114,8 @@ def main(input_df,
     final_tree = copy.deepcopy(nj_tree)
 
     if ancestral_reconstruction:
+        logger.info("Compiling input sequences into FSAs for ancestor reconstruction.")
+        FSA_dict = create_fsa_dict_from_strings(CN_str_dict, symbol_table)
         logger.info("Reconstructing ancestors.")
         ancestors = medicc.reconstruct_ancestors(tree=final_tree,
                                                  samples_dict=FSA_dict,
@@ -150,7 +164,15 @@ def create_standard_fsa_dict_from_data(input_data,
     The keys of the dictionary are the sample/taxon names. 
     If the input is a DataFrame, the FSA will be the concatenated copy number profiles of all allele columns"""
 
-    fsa_dict = {}
+    cn_str_dict = create_cn_string_dict_from_data(input_data, separator)
+    fsa_dict = create_fsa_dict_from_strings(cn_str_dict, symbol_table)
+
+    return fsa_dict, cn_str_dict
+
+
+def create_cn_string_dict_from_data(input_data,
+                                    separator: str = "X") -> dict:
+    """Create compact copy-number strings without constructing native FSAs."""
     cn_str_dict = {}
     if isinstance(input_data, pd.DataFrame):
         logger.info('Creating FSA for pd.DataFrame with the following data columns: {}'.format(
@@ -167,16 +189,24 @@ def create_standard_fsa_dict_from_data(input_data,
     else:
         raise MEDICCError("Input to function create_standard_fsa_dict_from_data has to be either"
                           "pd.DataFrame or pd.Series. \n input provided was {}".format(type(input_data)))
-    
-    for taxon, cnp in input_data.groupby('sample_id'):
-        cn_str = aggregate_copy_number_profile(cnp)
-        fsa_dict[taxon] = fstlib.factory.from_string(cn_str,
-                                                     arc_type="standard",
-                                                     isymbols=symbol_table,
-                                                     osymbols=symbol_table)
-        cn_str_dict[taxon] = cn_str
 
-    return fsa_dict, cn_str_dict
+    for taxon, cnp in input_data.groupby('sample_id'):
+        cn_str_dict[taxon] = aggregate_copy_number_profile(cnp)
+
+    return cn_str_dict
+
+
+def create_fsa_dict_from_strings(cn_str_dict,
+                                 symbol_table: fstlib.SymbolTable) -> dict:
+    """Construct native FSAs from precompiled copy-number strings."""
+    return {
+        taxon: fstlib.factory.from_string(
+            cn_str,
+            arc_type="standard",
+            isymbols=symbol_table,
+            osymbols=symbol_table)
+        for taxon, cn_str in cn_str_dict.items()
+    }
 
 
 def create_phasing_fsa_dict_from_df(input_df: pd.DataFrame, symbol_table: fstlib.SymbolTable, separator: str = "X") -> dict:
@@ -253,10 +283,8 @@ def create_df_from_fsa(input_df: pd.DataFrame, fsa, separator: str = 'X'):
 
     nr_alleles = len(alleles)
     samples = input_df.index.get_level_values('sample_id').unique()
-    output_df = input_df.unstack('sample_id')
-
-    # Create dict and concat later to prevent pandas PerformanceWarning
-    internal_cns = dict()
+    segment_index = input_df.xs(samples[0], level='sample_id').index
+    internal_frames = []
     for node in fsa:
         if node in samples:
             continue
@@ -267,18 +295,25 @@ def create_df_from_fsa(input_df: pd.DataFrame, fsa, separator: str = 'X'):
                                                                                                     len(cns),
                                                                                                     nr_alleles))
         nr_chroms = int(len(cns) // nr_alleles)
+        node_cn = {}
         for i, allele in enumerate(alleles):
-            cn = list(''.join(cns[(i*nr_chroms):((i+1)*nr_chroms)]))
-            internal_cns[(allele, node)] = cn
+            node_cn[allele] = list(
+                ''.join(cns[(i*nr_chroms):((i+1)*nr_chroms)]))
+        internal_frames.append(pd.DataFrame(node_cn, index=segment_index))
 
-    internal_cns_df = pd.DataFrame(internal_cns, index=output_df.index)
-    internal_cns_df.columns.names = ['allele', 'sample_id']
-    output_df = (pd.concat([output_df, internal_cns_df], axis=1)
-                 .stack('sample_id')
-                 .reorder_levels(['sample_id', 'chrom', 'start', 'end'])
-                 .sort_index())
+    if not internal_frames:
+        return input_df.sort_index()
 
-    return output_df
+    internal_nodes = [
+        node for node in fsa
+        if node not in samples
+    ]
+    internal_df = pd.concat(
+        internal_frames, keys=internal_nodes, names=['sample_id'])
+    internal_df.index = internal_df.index.set_names(
+        ['sample_id', 'chrom', 'start', 'end'])
+
+    return pd.concat([input_df, internal_df], axis=0).sort_index()
 
 
 def create_df_from_phasing_fsa(input_df: pd.DataFrame, fsas, separator: str = 'X'):
@@ -348,6 +383,9 @@ def shorten_cn_strings(string_1, string_2):
 
 def parallelization_calc_pairwise_distance(sample_labels, asymm_fst, CN_str_dict, n_cores):
     workers_default = max(1, min(int(n_cores), 2)) if n_cores is not None else 1
+    slurm_memory_mb = _env_int("SLURM_MEM_PER_NODE", 0)
+    if slurm_memory_mb and slurm_memory_mb < 196608:
+        workers_default = 1
     os.environ.setdefault("MEDICC2_PAIRWISE_WORKERS", str(workers_default))
     logger.info("Using memory-bounded pairwise MEDICC implementation; "
                 "set MEDICC2_PAIRWISE_WORKERS and MEDICC2_PAIRWISE_BATCH_SIZE to tune.")
@@ -393,9 +431,11 @@ def _pairwise_chunk_worker(chunk):
     return results
 
 
-def _pairwise_chunks(samples, batch_size):
+def _pairwise_chunks(samples, batch_size, completed_mask=None):
     chunk = []
     for sample_a_idx, sample_b_idx in combinations(range(len(samples)), 2):
+        if completed_mask is not None and completed_mask[sample_a_idx, sample_b_idx]:
+            continue
         chunk.append((sample_a_idx, sample_b_idx,
                       samples[sample_a_idx], samples[sample_b_idx]))
         if len(chunk) >= batch_size:
@@ -409,6 +449,17 @@ def _fill_pairwise_distances(pdm, chunk_results):
     for sample_a_idx, sample_b_idx, cur_dist in chunk_results:
         pdm[sample_a_idx, sample_b_idx] = cur_dist
         pdm[sample_b_idx, sample_a_idx] = cur_dist
+
+
+def _chunk_waves(chunks, workers):
+    wave = []
+    for chunk in chunks:
+        wave.append(chunk)
+        if len(wave) == workers:
+            yield wave
+            wave = []
+    if wave:
+        yield wave
 
 
 def _pairwise_child_worker(connection, model_fst, cn_str_dict, chunk):
@@ -437,29 +488,225 @@ def _run_pairwise_chunk_in_forked_child(ctx, model_fst, cn_str_dict, chunk):
     return payload
 
 
+def _external_chunk_payload(cn_str_dict, chunk):
+    return [
+        (sample_a_idx, sample_b_idx,
+         cn_str_dict[sample_a], cn_str_dict[sample_b])
+        for sample_a_idx, sample_b_idx, sample_a, sample_b in chunk
+    ]
+
+
+def _run_pairwise_chunks_in_external_workers(model_path, cn_str_dict, chunks):
+    workers = []
+    for chunk in chunks:
+        command = [
+            sys.executable,
+            os.path.join(os.path.dirname(__file__), "pairwise_worker.py"),
+            model_path,
+        ]
+        process = subprocess.Popen(
+            command,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE)
+        payload = pickle.dumps(
+            _external_chunk_payload(cn_str_dict, chunk),
+            protocol=pickle.HIGHEST_PROTOCOL)
+        process.stdin.write(payload)
+        process.stdin.close()
+        workers.append(process)
+
+    all_results = []
+    errors = []
+    for process in workers:
+        stdout = process.stdout.read()
+        stderr = process.stderr.read().decode("utf-8", errors="replace")
+        returncode = process.wait()
+        process.stdout.close()
+        process.stderr.close()
+        if returncode != 0:
+            errors.append(
+                f"external pairwise worker exited with status {returncode}: {stderr}")
+            continue
+        try:
+            ok, payload = pickle.loads(stdout)
+        except Exception as exc:
+            errors.append(
+                f"external pairwise worker returned invalid data: {exc!r}; {stderr}")
+            continue
+        if not ok:
+            errors.append(str(payload))
+        else:
+            all_results.extend(payload)
+
+    if errors:
+        raise RuntimeError("; ".join(errors))
+    return all_results
+
+
+def _pairwise_thread_init(model_fst, cn_str_dict):
+    global _PAIRWISE_THREAD_MODEL_STATE
+    global _PAIRWISE_THREAD_CN_STR_DICT
+    _PAIRWISE_THREAD_MODEL_STATE = model_fst.write_to_string()
+    _PAIRWISE_THREAD_CN_STR_DICT = cn_str_dict
+
+
+def _pairwise_thread_chunk_worker(chunk):
+    model_fst = getattr(_PAIRWISE_THREAD_LOCAL, "model_fst", None)
+    if model_fst is None:
+        model_fst = fstlib.Fst.read_from_string(_PAIRWISE_THREAD_MODEL_STATE)
+        _PAIRWISE_THREAD_LOCAL.model_fst = model_fst
+
+    results = []
+    for sample_a_idx, sample_b_idx, sample_a, sample_b in chunk:
+        cur_dist = calc_MED_distance(
+            model_fst,
+            _PAIRWISE_THREAD_CN_STR_DICT[sample_a],
+            _PAIRWISE_THREAD_CN_STR_DICT[sample_b])
+        results.append((sample_a_idx, sample_b_idx, cur_dist))
+    return results
+
+
+def _profile_fingerprints(samples, cn_str_dict):
+    return [
+        hashlib.sha256(cn_str_dict[sample].encode("utf-8")).hexdigest()
+        for sample in samples
+    ]
+
+
+def _load_pairwise_checkpoint(path, samples, profile_fingerprints, shape):
+    completed = np.eye(shape[0], dtype=bool)
+    pdm = np.zeros(shape, dtype=float)
+    if not path or not os.path.exists(path):
+        return pdm, completed
+
+    with np.load(path, allow_pickle=False) as checkpoint:
+        checkpoint_samples = checkpoint["samples"].tolist()
+        checkpoint_fingerprints = checkpoint.get(
+            "profile_fingerprints", np.asarray([])).tolist()
+        if (checkpoint_samples != samples or
+                checkpoint_fingerprints != profile_fingerprints):
+            logger.warning(
+                "Ignoring pairwise checkpoint because its input profiles "
+                "do not match the current run.")
+            return pdm, completed
+        if (checkpoint["pdm"].shape != shape or
+                checkpoint["completed"].shape != shape):
+            logger.warning(
+                "Ignoring pairwise checkpoint because its dimensions "
+                "do not match the current run.")
+            return pdm, completed
+        return checkpoint["pdm"].copy(), checkpoint["completed"].copy()
+
+
+def _save_pairwise_checkpoint(
+        path, samples, profile_fingerprints, pdm, completed):
+    if not path:
+        return
+    directory = os.path.dirname(os.path.abspath(path))
+    os.makedirs(directory, exist_ok=True)
+    fd, temporary_path = tempfile.mkstemp(
+        prefix=".medicc2-pairwise-", suffix=".npz", dir=directory)
+    os.close(fd)
+    try:
+        np.savez_compressed(
+            temporary_path,
+            samples=np.asarray(samples),
+            profile_fingerprints=np.asarray(profile_fingerprints),
+            pdm=pdm,
+            completed=completed)
+        os.replace(temporary_path, path)
+    finally:
+        if os.path.exists(temporary_path):
+            os.unlink(temporary_path)
+
+
+def _record_completed(completed, chunk_results):
+    for sample_a_idx, sample_b_idx, _ in chunk_results:
+        completed[sample_a_idx, sample_b_idx] = True
+        completed[sample_b_idx, sample_a_idx] = True
+
+
 def calc_pairwise_distance_matrix(model_fst, cn_str_dict, parallel_run=True):
     samples = list(cn_str_dict.keys())
-    pdm = np.zeros((len(samples), len(samples)), dtype=float)
+    checkpoint_path = os.environ.get("MEDICC2_PAIRWISE_CHECKPOINT")
+    shape = (len(samples), len(samples))
+    profile_fingerprints = _profile_fingerprints(samples, cn_str_dict)
+    pdm, completed_mask = _load_pairwise_checkpoint(
+        checkpoint_path, samples, profile_fingerprints, shape)
     ncombs = len(samples) * (len(samples) - 1) // 2
+    completed = int(np.count_nonzero(np.triu(completed_mask, k=1)))
     next_log_percentage = 10
     batch_size = max(1, _env_int("MEDICC2_PAIRWISE_BATCH_SIZE", 64))
     workers = max(1, _env_int("MEDICC2_PAIRWISE_WORKERS", 1))
-    mode = os.environ.get("MEDICC2_PAIRWISE_MODE", "forked").strip().lower()
+    mode = os.environ.get("MEDICC2_PAIRWISE_MODE", "external").strip().lower()
+    chunks = _pairwise_chunks(
+        samples, batch_size, completed_mask=completed_mask)
 
-    if mode == "forked" and ncombs > batch_size and "fork" in mp.get_all_start_methods():
+    if mode == "external" and ncombs > completed:
+        logger.info("Calculating pairwise MEDICC distances in fresh external workers "
+                    "(pairs=%d, batch_size=%d, workers=%d).",
+                    ncombs, batch_size, workers)
+        with tempfile.TemporaryDirectory(prefix="medicc2-pairwise-") as temp_dir:
+            model_path = os.path.join(temp_dir, "model.fst")
+            model_fst.write(model_path)
+            if not os.path.isfile(model_path):
+                raise RuntimeError("Could not serialize MEDICC model for external workers.")
+            for wave in _chunk_waves(chunks, workers):
+                chunk_results = _run_pairwise_chunks_in_external_workers(
+                    model_path, cn_str_dict, wave)
+                _fill_pairwise_distances(pdm, chunk_results)
+                _record_completed(completed_mask, chunk_results)
+                completed += len(chunk_results)
+                _save_pairwise_checkpoint(
+                    checkpoint_path, samples, profile_fingerprints,
+                    pdm, completed_mask)
+                if ncombs > 0:
+                    percentage_done = 100 * completed / ncombs
+                    if percentage_done >= next_log_percentage:
+                        logger.info(f'{percentage_done:.2f}')
+                        next_log_percentage += 10
+        return pd.DataFrame(pdm, index=samples, columns=samples)
+
+    if mode == "threads" and ncombs > completed:
+        logger.info("Calculating pairwise MEDICC distances with native threads "
+                    "(pairs=%d, batch_size=%d, workers=%d).",
+                    ncombs, batch_size, workers)
+        _pairwise_thread_init(model_fst, cn_str_dict)
+        with ThreadPoolExecutor(max_workers=workers) as executor:
+            for wave in _chunk_waves(chunks, workers):
+                for chunk_results in executor.map(
+                        _pairwise_thread_chunk_worker, wave):
+                    _fill_pairwise_distances(pdm, chunk_results)
+                    _record_completed(completed_mask, chunk_results)
+                    completed += len(chunk_results)
+                _save_pairwise_checkpoint(
+                    checkpoint_path, samples, profile_fingerprints,
+                    pdm, completed_mask)
+                if ncombs > 0:
+                    percentage_done = 100 * completed / ncombs
+                    if percentage_done >= next_log_percentage:
+                        logger.info(f'{percentage_done:.2f}')
+                        next_log_percentage += 10
+        return pd.DataFrame(pdm, index=samples, columns=samples)
+
+    if mode == "forked" and ncombs > completed and "fork" in mp.get_all_start_methods():
         logger.info("Calculating pairwise MEDICC distances in forked batches "
                     "(pairs=%d, batch_size=%d, workers=%d).",
                     ncombs, batch_size, workers)
-        completed = 0
         ctx = mp.get_context("fork")
         if workers != 1:
             logger.warning("MEDICC2_PAIRWISE_WORKERS=%d requested, but forked mode "
                            "currently runs one batch process at a time.", workers)
-        for chunk in _pairwise_chunks(samples, batch_size):
+        for chunk in chunks:
             chunk_results = _run_pairwise_chunk_in_forked_child(
                 ctx, model_fst, cn_str_dict, chunk)
             _fill_pairwise_distances(pdm, chunk_results)
+            _record_completed(completed_mask, chunk_results)
             completed += len(chunk_results)
+            _save_pairwise_checkpoint(
+                checkpoint_path, samples, profile_fingerprints,
+                pdm, completed_mask)
             if ncombs > 0:
                 percentage_done = 100 * completed / ncombs
                 if percentage_done >= next_log_percentage:
@@ -469,12 +716,16 @@ def calc_pairwise_distance_matrix(model_fst, cn_str_dict, parallel_run=True):
 
     logger.info("Calculating pairwise MEDICC distances in-process "
                 "(pairs=%d, mode=%s).", ncombs, mode)
-    for i, chunk in enumerate(_pairwise_chunks(samples, batch_size), start=1):
+    for chunk in chunks:
         _pairwise_worker_init(model_fst, cn_str_dict)
         chunk_results = _pairwise_chunk_worker(chunk)
         _fill_pairwise_distances(pdm, chunk_results)
+        _record_completed(completed_mask, chunk_results)
+        completed += len(chunk_results)
+        _save_pairwise_checkpoint(
+            checkpoint_path, samples, profile_fingerprints,
+            pdm, completed_mask)
 
-        completed = min(i * batch_size, ncombs)
         if ncombs > 0:
             percentage_done = 100 * completed / ncombs
             if percentage_done >= next_log_percentage:

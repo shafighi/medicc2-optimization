@@ -12,6 +12,23 @@ from medicc import io, tools
 logger = logging.getLogger(__name__)
 
 
+def _load_event_fsts(total_cn=False, wgd_x2=False, no_wgd=False):
+    event_fsts = list(io.load_main_fsts(return_symbol_table=True))
+    if total_cn:
+        event_fsts[0] = io.read_fst(total_copy_numbers=True)
+        event_fsts[2] = io.read_fst(total_copy_numbers=True, n_wgd=1)
+        event_fsts[3] = None
+    elif wgd_x2:
+        event_fsts[0] = io.read_fst(wgd_x2=True)
+        event_fsts[2] = io.read_fst(wgd_x2=True, n_wgd=1)
+        event_fsts[3] = None
+    elif no_wgd:
+        event_fsts[0] = io.read_fst(no_wgd=True)
+        event_fsts[2] = None
+        event_fsts[3] = None
+    return tuple(event_fsts)
+
+
 def calculate_all_cn_events(tree, cur_df, alleles=['cn_a', 'cn_b'], normal_name='diploid',
                             wgd_x2=False, no_wgd=False, total_cn=False, max_wgd=1):
     """Create a DataFrame containing all copy-number events in the current data
@@ -33,9 +50,11 @@ def calculate_all_cn_events(tree, cur_df, alleles=['cn_a', 'cn_b'], normal_name=
         cur_df[['is_normal', 'is_clonal']] = False
         events = None
     else:
-
-        events = pd.DataFrame(columns=['sample_id', 'chrom', 'start',
-                                    'end', 'allele', 'type', 'cn_child'])
+        event_columns = [
+            'sample_id', 'chrom', 'start', 'end', 'allele', 'type', 'cn_child']
+        event_frames = []
+        event_fsts = _load_event_fsts(
+            total_cn=total_cn, wgd_x2=wgd_x2, no_wgd=no_wgd)
 
         clades = [x for x in tree.find_clades()]
 
@@ -51,16 +70,30 @@ def calculate_all_cn_events(tree, cur_df, alleles=['cn_a', 'cn_b'], normal_name=
 
                 cur_df, cur_events = calculate_cn_events_per_branch(
                     cur_df, clade.name, child.name, alleles=alleles, wgd_x2=wgd_x2,
-                    total_cn=total_cn, no_wgd=no_wgd, normal_name=normal_name, max_wgd=max_wgd)
+                    total_cn=total_cn, no_wgd=no_wgd, normal_name=normal_name,
+                    max_wgd=max_wgd, event_fsts=event_fsts, copy_input=False)
 
-                events = pd.concat([events, cur_events])
+                event_frames.append(cur_events)
 
-        events = events.reset_index(drop=True)
+        events = pd.concat(
+            [pd.DataFrame(columns=event_columns)] + event_frames,
+            ignore_index=True)
 
-        is_normal = ~cur_df.unstack('sample_id')[['is_loss', 'is_gain', 'is_wgd']].any(axis=1)
+        event_flags = ['is_loss', 'is_gain', 'is_wgd']
+        segment_levels = ['chrom', 'start', 'end']
+        is_normal = ~(
+            cur_df[event_flags]
+            .groupby(level=segment_levels, sort=True)
+            .any()
+            .any(axis=1))
         is_normal.name = 'is_normal'
         mrca = [x for x in tree.root.clades if x.name != normal_name][0].name
-        is_clonal = ~cur_df.loc[cur_df.index.get_level_values('sample_id')!=mrca].unstack('sample_id')[['is_loss', 'is_gain', 'is_wgd']].any(axis=1)
+        non_mrca = cur_df.index.get_level_values('sample_id') != mrca
+        is_clonal = ~(
+            cur_df.loc[non_mrca, event_flags]
+            .groupby(level=segment_levels, sort=True)
+            .any()
+            .any(axis=1))
         is_clonal.name = 'is_clonal'
 
         cur_df = cur_df.drop(['is_normal', 'is_clonal'], axis=1, errors='ignore')
@@ -82,7 +115,7 @@ def calculate_all_cn_events(tree, cur_df, alleles=['cn_a', 'cn_b'], normal_name=
 
 def calculate_cn_events_per_branch(cur_df, parent_name, child_name, alleles=['cn_a', 'cn_b'],
                                    wgd_x2=False, total_cn=False, no_wgd=False, normal_name='diploid',
-                                   max_wgd=1):
+                                   max_wgd=1, event_fsts=None, copy_input=True):
     """Calculate copy-number events for a single branch. Used in calculate_all_cn_events
 
     Args:
@@ -96,26 +129,18 @@ def calculate_cn_events_per_branch(cur_df, parent_name, child_name, alleles=['cn
         pandas.DataFrame: DataFrame of copy-number events
     """
 
-    cur_df = cur_df.copy()
+    if copy_input:
+        cur_df = cur_df.copy()
     if len(np.setdiff1d(['is_gain', 'is_loss', 'is_wgd'], cur_df.columns)) > 0:
         cur_df[['is_gain', 'is_loss', 'is_wgd']] = False
-    cur_df[alleles] = cur_df[alleles].astype(int)
+    if not all(pd.api.types.is_integer_dtype(cur_df[allele]) for allele in alleles):
+        cur_df[alleles] = cur_df[alleles].astype(int)
 
-    # TODO: load these outside of the function so they are not loaded every time
-    asymm_fst, asymm_fst_nowgd, asymm_fst_1_wgd, asymm_fst_2_wgd, symbol_table = io.load_main_fsts(
-        return_symbol_table=True)
-    if total_cn:
-        asymm_fst = io.read_fst(total_copy_numbers=True)
-        asymm_fst_1_wgd = io.read_fst(total_copy_numbers=True, n_wgd=1)
-        asymm_fst_2_wgd = None
-    elif wgd_x2:
-        asymm_fst = io.read_fst(wgd_x2=True)
-        asymm_fst_1_wgd = io.read_fst(wgd_x2=True, n_wgd=1)
-        asymm_fst_2_wgd = None
-    elif no_wgd:
-        asymm_fst = io.read_fst(no_wgd=True)
-        asymm_fst_1_wgd = None
-        asymm_fst_2_wgd = None
+    if event_fsts is None:
+        event_fsts = _load_event_fsts(
+            total_cn=total_cn, wgd_x2=wgd_x2, no_wgd=no_wgd)
+    (asymm_fst, asymm_fst_nowgd, asymm_fst_1_wgd,
+     asymm_fst_2_wgd, symbol_table) = event_fsts
 
 
     events_df = pd.DataFrame(columns=['sample_id', 'chrom', 'start', 'end', 'allele', 'type', 'cn_child'])

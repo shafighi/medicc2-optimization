@@ -11,6 +11,7 @@ test
 examples/output_gundem_et_al_2015/*nj*
 examples/output_gundem_et_al_2015/*pdm*
 examples/output_gundem_et_al_2015/*tree.txt
+examples/test_output/
 *.code-workspace
 *.pyc
 __pycache__
@@ -22,3 +23,4 @@ dist
 build
 medicc2.egg-info
 .DS_Store
+benchmarks/

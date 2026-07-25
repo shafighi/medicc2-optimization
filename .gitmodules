@@ -1,3 +1,4 @@
 [submodule "fstlib"]
 	path = submodule-fstlib
-	url = https://bitbucket.org/schwarzlab/fstlib.git
+	url = https://github.com/shafighi/medicc2-optimization.git
+	branch = fstlib-optimize-kernel-memory

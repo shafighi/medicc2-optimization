@@ -174,10 +174,18 @@ def validate_input(input_df, symbol_table=None, normal_name='diploid'):
         input_df.index.get_level_values('end').dtype != int):
         raise MEDICCIOError("Start and end columns must be of type: integer.")
 
-    # Check if all samples have same segments
-    if input_df.unstack('sample_id').isna().sum().sum() != 0:
+    # Compare each sample's segment index without materializing a wide
+    # sample-by-segment table.
+    sample_ids = input_df.index.get_level_values('sample_id').unique()
+    reference_segments = input_df.xs(sample_ids[0], level='sample_id').index
+    segments_match = all(
+        input_df.xs(sample_id, level='sample_id').index.equals(reference_segments)
+        for sample_id in sample_ids[1:])
+    has_missing_values = any(input_df[column].hasnans for column in input_df)
+    if has_missing_values or not segments_match:
+        unique_segments = input_df.index.droplevel('sample_id').unique()
         raise MEDICCIOError("The samples have different segments!\n"
-                            "Total number of unique segments: {}\n".format(len(input_df.unstack('sample_id'))))
+                            "Total number of unique segments: {}\n".format(len(unique_segments)))
 
     if symbol_table is not None:
         # Check if symbols are in symbol table
