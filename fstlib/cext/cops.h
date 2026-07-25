@@ -9,6 +9,8 @@
 #include <iomanip>
 #include <set>
 #include <map>
+#include <cstdlib>
+#include <cstring>
 // #include <chrono>
 
 
@@ -17,6 +19,31 @@ const float mydelta = 1.0F/(8192.0F*4);
 
 using namespace fst;
 // using namespace std::chrono;
+
+template <typename Arc>
+void configure_kernel_compose_cache(ComposeFstOptions<Arc> &options) {
+	const char *mode = std::getenv("MEDICC2_FST_CACHE_MODE");
+	if (mode == nullptr || mode[0] == '\0' ||
+			std::strcmp(mode, "default") == 0) {
+		return;
+	}
+
+	const char *bytes = std::getenv("MEDICC2_FST_CACHE_BYTES");
+	if (bytes != nullptr && bytes[0] != '\0') {
+		char *end = nullptr;
+		const unsigned long long parsed = std::strtoull(bytes, &end, 10);
+		if (end != bytes && *end == '\0') {
+			options.gc_limit = static_cast<size_t>(parsed);
+			return;
+		}
+	}
+
+	if (std::strcmp(mode, "streaming") == 0) {
+		// A zero-byte limit makes OpenFST reuse its first cache state during
+		// single-pass shortest-distance traversal.
+		options.gc_limit = 0;
+	}
+}
 
 //void shortest_path(script::FstClass &model, script::FstClass &input, script::FstClass &output, script::MutableFstClass* path, std::vector<script::WeightClass>* distance) {
 void align_std_impl(script::FstClass &model, script::FstClass &input, script::FstClass &output, script::MutableFstClass* path) {	
@@ -164,7 +191,7 @@ script::WeightClass kernel_score_std_impl(script::FstClass &model, script::FstCl
 
 	// set compose options
 	ComposeFstOptions<StdArc> co;
-	//co.gc_limit=0;
+	configure_kernel_compose_cache(co);
 
 	// Container for composition result.
 	InvertFst<StdArc> middle1 = InvertFst<StdArc>(ComposeFst<StdArc>(*tfst, input_sorted, co));
@@ -218,7 +245,7 @@ script::WeightClass kernel_score_log_impl(script::FstClass &model, script::FstCl
 
 	// set compose options
 	ComposeFstOptions<LogArc> co;
-	//co.gc_limit=0;
+	configure_kernel_compose_cache(co);
 
 	// Container for composition result.
 	InvertFst<LogArc> middle1 = InvertFst<LogArc>(ComposeFst<LogArc>(*tfst, input_sorted, co));
@@ -324,7 +351,7 @@ script::WeightClass multi_kernel_score_std_impl(script::FstClass &loh, script::F
 
 	// set compose options
 	ComposeFstOptions<StdArc> co;
-	//co.gc_limit=0;
+	configure_kernel_compose_cache(co);
 
     InvertFst<StdArc> left = InvertFst<StdArc>(ComposeFst<StdArc>(*lohfst, ComposeFst<StdArc>(*wgdfst, ComposeFst<StdArc>(*gainfst, ComposeFst<StdArc>(*lossfst, input_sorted, co), co), co), co));
     ComposeFst<StdArc> right = ComposeFst<StdArc>(*lohfst, ComposeFst<StdArc>(*wgdfst, ComposeFst<StdArc>(*gainfst, ComposeFst<StdArc>(*lossfst, output_sorted, co), co), co), co);
